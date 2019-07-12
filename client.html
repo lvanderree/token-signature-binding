@@ -1,0 +1,210 @@
+<html>
+	<body>
+	Open de inspector/console van je browser...
+	<script>
+
+		const enc = new TextEncoder();
+		const dec = new TextDecoder();
+
+		function makeKeyPair() {
+			return window.crypto.subtle.generateKey(
+					{
+						name: "RSASSA-PKCS1-v1_5",
+						// Consider using a 4096-bit key for systems that require long-term security
+						modulusLength: 2048,
+						publicExponent: new Uint8Array([1, 0, 1]),
+						hash: "SHA-256",
+					},
+					true,
+					["sign", "verify"]
+			);
+		}
+
+		function callOnStore(fn_) {
+			// This works on all devices/browsers, and uses IndexedDBShim as a final fallback
+			var indexedDB = window.indexedDB || window.mozIndexedDB || window.webkitIndexedDB || window.msIndexedDB || window.shimIndexedDB;
+
+			// Open (or create) the database
+			var open = indexedDB.open("KeyDB", 1);
+
+			// Create the schema
+			open.onupgradeneeded = function() {
+				var db = open.result;
+				var store = db.createObjectStore("KeyPair", {keyPath: "id"});
+			};
+
+
+			return open.onsuccess = function() {
+				// Start a new transaction
+				var db = open.result;
+				var tx = db.transaction("KeyPair", "readwrite");
+				var store = tx.objectStore("KeyPair");
+
+				result = fn_(store);
+
+
+				// Close the db when the transaction is done
+				tx.oncomplete = function() {
+					db.close();
+				};
+
+				return result;
+			}
+		}
+
+		function getKeysThen(fn_) {
+			callOnStore(function (store) {
+				var getData = store.get(1);
+
+				getData.onsuccess = async function () {
+					keyPair = getData.result ? getData.result.keys : null;
+
+					if (keyPair) {
+						fn_(keyPair);
+					} else {
+						keyPair = makeKeyPair().then((keyPair) => {
+							callOnStore(function (store) {
+								store.put({id: 1, keys: keyPair});
+							});
+
+							fn_(keyPair);
+						});
+					}
+
+				};
+			});
+		};
+
+		function b64EncodeUnicode(str) {
+			return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match, p1) {
+				return String.fromCharCode('0x' + p1);
+			}));
+		}
+
+		function b64DecodeUnicode(str) {
+			return decodeURIComponent(Array.prototype.map.call(atob(str), function(c) {
+				return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+			}).join(''));
+		}
+
+		function addNewLines(str) {
+			var finalString = '';
+			for(var i=0; i < str.length; i++) {
+				finalString += str.substring(0, 64) + '\n';
+				str = str.substring(64);
+			}
+			finalString += str;
+
+			return finalString;
+		}
+
+		function removeLines(pem) {
+			var lines = pem.split('\n');
+			var encodedString = '';
+			for(var i=0; i < lines.length; i++) {
+				encodedString += lines[i].trim();
+			}
+			return encodedString;
+		}
+
+		function stringToArrayBuffer(byteString){
+			var byteArray = new Uint8Array(byteString.length);
+			for(var i=0; i < byteString.length; i++) {
+				byteArray[i] = byteString.codePointAt(i);
+			}
+			return byteArray;
+		}
+
+		function  arrayBufferToString(exportedPrivateKey){
+			var byteArray = new Uint8Array(exportedPrivateKey);
+			var byteString = '';
+			for(var i=0; i < byteArray.byteLength; i++) {
+				byteString += String.fromCodePoint(byteArray[i]);
+			}
+			return byteString;
+		}
+
+
+        // HERE we go, get a (private/public)keyPair
+		getKeysThen(async function(keyPair) {
+			console.log('keyPair', keyPair);
+
+			const enc = new TextEncoder();
+			const dec = new TextDecoder();
+
+			const publicKey = await window.crypto.subtle.exportKey("spki", keyPair.publicKey)
+				.then(function(keydata){
+					return keydata;
+				})
+				.catch(function(err){
+					console.error('error', err);
+				});
+
+            // export the public key
+            let body = window.btoa(String.fromCharCode(...new Uint8Array(publicKey)));
+            body = body.match(/.{1,64}/g).join('\n');
+            const publicKeyPem = btoa(`-----BEGIN PUBLIC KEY-----\n${body}\n-----END PUBLIC KEY-----`);
+            console.log('publicKeyPem:', publicKeyPem);
+
+
+			data = enc.encode("poc-something");
+			console.log('data:', dec.decode(data));
+
+			signature = await window.crypto.subtle.sign("RSASSA-PKCS1-v1_5", keyPair.privateKey, data);
+            // signature64 = window.btoa(String.fromCharCode(...new Uint8Array(signature)));
+            // console.log('deze', arrayBufferToString(signature));
+			signature64 = b64EncodeUnicode(arrayBufferToString(signature));
+            console.log('signature64', signature64);
+
+			signature64b = stringToArrayBuffer(b64DecodeUnicode(removeLines(signature64)));
+
+			const result = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', keyPair.publicKey, signature, data);
+			console.log('verifies1', result);
+			const result2 = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', keyPair.publicKey, signature64b, data);
+			console.log('verifies2', result2);
+
+
+            // Get an accesstoken by providing this public key during authentication
+            fetch('http://localhost:3000/auth', {
+                method: 'post',
+                headers: {
+                    'Accept': 'application/json',
+                    'pubKey': publicKeyPem
+                }
+            }).then(function (res) {
+                return res.json();
+            }).then(json => {
+                const token = json.token;
+
+                console.log('token', token);
+
+                // after authentication call API with accesstoken AND encrypted value of something fixed, and something dynamic (so the encrypted value cannot be the same as before)
+                fetch('http://localhost:3000/resource', {
+                    method: 'get',
+                    headers: {
+                        'Accept': 'application/json',
+                        'Authorization': `Bearer ${token}`,
+                        'signature': signature64
+                    }
+                }).then(function (res) {
+                    return res.json();
+                }).then(json => {
+                    json.token
+                    console.log('result', JSON.stringify(json));
+                }).catch(error => {
+                    console.log("error: ", error);
+                })
+
+
+            }).catch(error => {
+                console.log("error: ", error);
+            })
+
+		} );
+
+
+	</script>
+	</body>
+</html>
+
+
